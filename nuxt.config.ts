@@ -2,9 +2,10 @@
 export default defineNuxtConfig({
   compatibilityDate: '2025-07-15',
   devtools: { enabled: true },
+  srcDir: '.',
+  pages: true, // 显式启用pages路由
   modules: ['@element-plus/nuxt','@pinia/nuxt'],
-  css: ['element-plus/dist/index.css'],
-   imports: {
+  imports: {
     dirs: ['stores/**'] // 自动导入 stores 目录下的 Pinia 仓库
   },
 
