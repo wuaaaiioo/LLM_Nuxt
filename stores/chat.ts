@@ -1,96 +1,166 @@
-// stores/chat.ts
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import dayjs from 'dayjs' // 用来格式化时间（记得先装：pnpm install dayjs）
+import { ref, computed, watch, nextTick } from 'vue'
+import dayjs from 'dayjs'
+import { sendChatStreamToBackend } from '~/composables/useChatAPI'
 
-// 1. 定义消息类型（用户/AI消息）
-type Message = {
-  id: string
-  content: string // 消息内容
-  role: 'user' | 'ai' // 消息发送方
-  time: string // 发送时间
+// 类型定义
+type Message = { 
+  id: string; 
+  content: string; 
+  role: 'user' | 'ai'; 
+  time: string 
 }
-
-// 2. 改造会话类型：新增 messages 字段（存储当前会话的所有消息）
-type Session = {
-  id: string
-  title: string
-  messages: Message[] // 新增：会话对应的消息列表
+type Session = { 
+  id: string; 
+  title: string; 
+  messages: Message[] 
 }
 
 export const useChatStore = defineStore('chat', () => {
-  // 原有状态：会话列表、当前选中会话ID
+  // 基础状态
   const activeSessionId = ref('')
   const sessionList = ref<Session[]>([])
-
-  // 新增状态：输入框内容、加载态（AI回复时显示）
   const inputMessage = ref('')
   const loading = ref(false)
 
-  
-  // 新增：计算属性 - 获取当前选中的会话
+  // 当前会话
   const currentSession = computed(() => {
-    return sessionList.value.find(item => item.id === activeSessionId.value)
+    return sessionList.value.find(s => s.id === activeSessionId.value)
   })
 
-  // 改造：新建会话时，初始化空消息列表
+  // ========== 1. 创建新会话（极简：无引导语） ==========
   const createNewSession = () => {
     const newSession: Session = {
       id: Date.now().toString(),
       title: '新会话',
-      messages: [] // 空消息列表
+      messages: [] // 空消息列表，无引导语
     }
     sessionList.value.push(newSession)
     activeSessionId.value = newSession.id
+    saveSessions()
   }
 
-  // 新增核心方法：发送消息（前端模拟版）
-  const sendMessage = () => {
-    // 1. 校验：输入为空则不执行
-    if (!inputMessage.value.trim()) return
+  // ========== 2. 本地存储（极简版） ==========
+  const loadSessions = () => {
+    if (process.client) {
+      const saved = localStorage.getItem('chat_sessions')
+      const activeId = localStorage.getItem('active_session_id')
+      if (saved) {
+        try {
+          sessionList.value = JSON.parse(saved)
+        } catch (e) {
+          sessionList.value = []
+        }
+      }
+      if (activeId) activeSessionId.value = activeId
+    }
+  }
+  const saveSessions = () => {
+    if (process.client) {
+      localStorage.setItem('chat_sessions', JSON.stringify(sessionList.value))
+      localStorage.setItem('active_session_id', activeSessionId.value)
+    }
+  }
 
-    // 2. 确保有当前会话（防止异常）
-    if (!currentSession.value) createNewSession()
+  // ========== 3. 删除会话 ==========
+  const deleteSession = (id: string) => {
+    sessionList.value = sessionList.value.filter(s => s.id !== id)
+    activeSessionId.value = sessionList.value[0]?.id || ''
+    saveSessions()
+    if (sessionList.value.length === 0) createNewSession()
+  }
 
-    // 3. 添加用户消息到当前会话
+  // ========== 4. 初始化（极简） ==========
+  const initSessions = () => {
+    loadSessions()
+    if (sessionList.value.length === 0) createNewSession()
+    else if (!activeSessionId.value) activeSessionId.value = sessionList.value[0].id
+  }
+
+  // ========== 5. 发送消息（核心：无引导语逻辑） ==========
+  const sendMessage = async () => {
+    const content = inputMessage.value.trim()
+    if (!content || loading.value || !currentSession.value) return
+
+    // 1. 添加用户消息
     const userMsg: Message = {
-      id: Date.now().toString(), // 时间戳做唯一ID
-      content: inputMessage.value.trim(),
+      id: Date.now().toString(),
+      content,
       role: 'user',
-      time: dayjs().format('HH:mm') // 格式化时间为 时:分
+      time: dayjs().format('HH:mm')
     }
     currentSession.value.messages.push(userMsg)
+    saveSessions()
 
-    // 4. 清空输入框，设置加载态（模拟AI思考中）
+    // 2. 初始化变量
     inputMessage.value = ''
     loading.value = true
+    const aiMsgId = Date.now().toString()
+    let fullContent = ''
 
-    // 5. 模拟AI回复（2秒后返回固定内容）
-    setTimeout(() => {
-      const aiMsg: Message = {
-        id: Date.now().toString(),
-        content: '你好👋！这是模拟的AI回复～你可以继续输入其他问题试试～',
-        role: 'ai',
-        time: dayjs().format('HH:mm')
+    // 3. 添加空AI消息
+    const aiMsg: Message = {
+      id: aiMsgId,
+      content: '',
+      role: 'ai',
+      time: dayjs().format('HH:mm')
+    }
+    currentSession.value.messages.push(aiMsg)
+    saveSessions()
+
+    // 4. 构造历史消息（极简：只传用户/AI消息）
+    const historyMessages = [{
+      role: 'system',
+      content: '你是一个专业、友好的AI助手，回答简洁易懂'
+    }]
+    currentSession.value.messages.forEach(msg => {
+      historyMessages.push({
+        role: msg.role === 'ai' ? 'assistant' : msg.role,
+        content: msg.content
+      })
+    })
+
+    // 5. 调用流式接口
+    await sendChatStreamToBackend(
+      historyMessages,
+      (chunk) => {
+        fullContent += chunk
+        // 更新AI消息
+        const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
+        if (index > -1) {
+          currentSession.value!.messages[index].content = fullContent
+        }
+      },
+      () => {
+        loading.value = false
+        // 更新会话标题
+        if (currentSession.value!.title === '新会话') {
+          currentSession.value!.title = content.slice(0, 10) || '新会话'
+          saveSessions()
+        }
+      },
+      (err) => {
+        loading.value = false
+        const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
+        if (index > -1) {
+          currentSession.value!.messages[index].content = `😥 出错了：${err}`
+        }
       }
-      currentSession.value!.messages.push(aiMsg)
-      loading.value = false // 关闭加载态
-    }, 2000)
+    )
   }
 
-  // 初始化：默认创建一个会话
-  if (sessionList.value.length === 0) {
-    createNewSession()
-  }
+  // 初始化 + 自动保存
+  initSessions()
+  watch([sessionList, activeSessionId], () => saveSessions(), { deep: true })
 
-  // 新增暴露的状态/方法
   return {
     activeSessionId,
     sessionList,
-    inputMessage, // 输入框内容
-    loading,      // 加载态
-    currentSession, // 当前会话
+    inputMessage,
+    loading,
+    currentSession,
     createNewSession,
-    sendMessage   // 发送消息方法
+    sendMessage,
+    deleteSession
   }
 })
