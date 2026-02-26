@@ -1,8 +1,11 @@
-# Nuxt Minimal Starter
+# 一个简单的仿豆包LLM对话平台，基于Vue+Nuxt+ElementPlus等构建
+十分的好用，喜欢点个star谢谢啦
+
+这是对应的后端链接
 
 Look at the [Nuxt documentation](https://nuxt.com/docs/getting-started/introduction) to learn more.
 
-## Setup
+## 安装Install
 
 Make sure to install dependencies:
 
@@ -37,39 +40,3 @@ yarn dev
 # bun
 bun run dev
 ```
-
-## Production
-
-Build the application for production:
-
-```bash
-# npm
-npm run build
-
-# pnpm
-pnpm build
-
-# yarn
-yarn build
-
-# bun
-bun run build
-```
-
-Locally preview production build:
-
-```bash
-# npm
-npm run preview
-
-# pnpm
-pnpm preview
-
-# yarn
-yarn preview
-
-# bun
-bun run preview
-```
-
-Check out the [deployment documentation](https://nuxt.com/docs/getting-started/deployment) for more information.
