@@ -32,6 +32,32 @@ export const sendChatStreamToBackend = async (
     }
 
     let buffer = ''
+
+    const processSSEEvent = (eventChunk: string) => {
+      const lines = eventChunk.split(/\r?\n/)
+      const dataLines: string[] = []
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue
+        let value = line.slice(5)
+        if (value.startsWith(' ')) {
+          value = value.slice(1)
+        }
+        dataLines.push(value)
+      }
+
+      if (!dataLines.length) return
+
+      const content = dataLines.join('\n')
+      if (content === '[DONE]') {
+        onComplete()
+        return true
+      }
+
+      onChunk(content)
+      return false
+    }
+
     // 4. 循环读取分段数据
     while (true) {
       const { done, value } = await reader.read()
@@ -39,32 +65,20 @@ export const sendChatStreamToBackend = async (
 
       // 5. 解码二进制数据
       buffer += decoder.decode(value, { stream: true })
-      // 6. 按 SSE 规范分割行（\n 或 \r\n）
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() || '' // 保留未完成的最后一行
+      // 6. 按 SSE 事件边界分段，保留换行和缩进
+      const events = buffer.split(/\r?\n\r?\n/)
+      buffer = events.pop() || ''
 
-      // 7. 逐行解析纯文本 SSE
-      for (const line of lines) {
-        const trimmedLine = line.trim()
-        if (!trimmedLine) continue
-
-        // 提取 data: 后的纯文本内容
-        if (trimmedLine.startsWith('data: ')) {
-          const content = trimmedLine.slice(6).trim()
-          console.log('📥 原生fetch收到分段：', content) // 关键日志
-          
-          if (content === '[DONE]') {
-            onComplete()
-            return
-          }
-          if (content) {
-            onChunk(content) // 直接传递纯文本给 Pinia
-          }
-        }
+      for (const eventChunk of events) {
+        const shouldStop = processSSEEvent(eventChunk)
+        if (shouldStop) return
       }
     }
 
     // 8. 流式结束
+    if (buffer) {
+      processSSEEvent(buffer)
+    }
     onComplete()
   } catch (err) {
     // 9. 捕获所有错误并回调

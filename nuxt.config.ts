@@ -15,10 +15,10 @@ export default defineNuxtConfig({
   nitro: {
     devProxy: {
       '/api': {
-        target: 'http://localhost:8000/api', // FastAPI 后端地址
+        target: 'http://localhost:8000', // FastAPI 后端地址
         changeOrigin: true, // 开启跨域
         prependPath: false, // 关键：关闭自动拼接路径
-        rewrite: (path) => path.replace(/^\/api/, '/api') // 确保路径是 /api/xxx
+        rewrite: (path) => path.replace(/^\/api/, '') // /api/chat -> /chat
       }
     }
   },

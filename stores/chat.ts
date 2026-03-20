@@ -8,7 +8,8 @@ type Message = {
   id: string; 
   content: string; 
   role: 'user' | 'ai'; 
-  time: string 
+  time: string;
+  status?: 'streaming' | 'done' | 'error'
 }
 type Session = { 
   id: string; 
@@ -17,6 +18,8 @@ type Session = {
 }
 
 export const useChatStore = defineStore('chat', () => {
+  const createId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+
   // 基础状态
   const activeSessionId = ref('')
   const sessionList = ref<Session[]>([])
@@ -31,7 +34,7 @@ export const useChatStore = defineStore('chat', () => {
   // ========== 1. 创建新会话（极简：无引导语） ==========
   const createNewSession = () => {
     const newSession: Session = {
-      id: Date.now().toString(),
+      id: createId(),
       title: '新会话',
       messages: [] // 空消息列表，无引导语
     }
@@ -84,7 +87,7 @@ export const useChatStore = defineStore('chat', () => {
 
     // 1. 添加用户消息
     const userMsg: Message = {
-      id: Date.now().toString(),
+      id: createId(),
       content,
       role: 'user',
       time: dayjs().format('HH:mm')
@@ -95,7 +98,7 @@ export const useChatStore = defineStore('chat', () => {
     // 2. 初始化变量
     inputMessage.value = ''
     loading.value = true
-    const aiMsgId = Date.now().toString()
+    const aiMsgId = createId()
     let fullContent = ''
 
     // 3. 添加空AI消息
@@ -103,7 +106,8 @@ export const useChatStore = defineStore('chat', () => {
       id: aiMsgId,
       content: '',
       role: 'ai',
-      time: dayjs().format('HH:mm')
+      time: dayjs().format('HH:mm'),
+      status: 'streaming'
     }
     currentSession.value.messages.push(aiMsg)
     saveSessions()
@@ -129,10 +133,15 @@ export const useChatStore = defineStore('chat', () => {
         const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
         if (index > -1) {
           currentSession.value!.messages[index].content = fullContent
+          currentSession.value!.messages[index].status = 'streaming'
         }
       },
       () => {
         loading.value = false
+        const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
+        if (index > -1) {
+          currentSession.value!.messages[index].status = 'done'
+        }
         // 更新会话标题
         if (currentSession.value!.title === '新会话') {
           currentSession.value!.title = content.slice(0, 10) || '新会话'
@@ -143,8 +152,12 @@ export const useChatStore = defineStore('chat', () => {
         loading.value = false
         const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
         if (index > -1) {
-          currentSession.value!.messages[index].content = `😥 出错了：${err}`
+          currentSession.value!.messages[index].status = 'error'
+          if (!currentSession.value!.messages[index].content.trim()) {
+            currentSession.value!.messages[index].content = '当前回答因网络或服务异常而中断。'
+          }
         }
+        console.error('chat stream error:', err)
       }
     )
   }
