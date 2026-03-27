@@ -1,170 +1,576 @@
 import { defineStore } from 'pinia'
-import { ref, computed, watch, nextTick } from 'vue'
+import { computed, ref } from 'vue'
 import dayjs from 'dayjs'
-import { sendChatStreamToBackend } from '~/composables/useChatAPI'
+import { useChatAPI, type ChatMessageDTO, type ChatSessionDTO } from '~/composables/useChatAPI'
 
-// 类型定义
-type Message = { 
-  id: string; 
-  content: string; 
-  role: 'user' | 'ai'; 
-  time: string;
-  status?: 'streaming' | 'done' | 'error'
+type Message = ChatMessageDTO
+
+type Session = ChatSessionDTO & {
+  persisted: boolean
+  messages: Message[]
+  nextCursor: string | null
+  hasMoreHistory: boolean
+  historyLoaded: boolean
+  historyLoading: boolean
 }
-type Session = { 
-  id: string; 
-  title: string; 
-  messages: Message[] 
+
+const SESSION_PAGE_SIZE = 20
+const MESSAGE_PAGE_SIZE = 20
+const SESSION_CACHE_KEY = 'nuxt_llm_session_list_cache'
+const SESSION_CACHE_TTL = 60 * 1000
+
+type SessionCachePayload = {
+  savedAt: number
+  page: number
+  hasMore: boolean
+  activeSessionId: string
+  items: Array<{
+    id: string
+    title: string
+    updatedAt?: string
+    preview?: string
+    persisted?: boolean
+  }>
 }
 
 export const useChatStore = defineStore('chat', () => {
-  const createId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+  const auth = useAuth()
+  const chatApi = useChatAPI()
 
-  // 基础状态
+  const createId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+  const isDraftSessionId = (sessionId: string) => sessionId.includes('_')
+  const createEmptySession = (overrides?: Partial<Session>): Session => ({
+    id: overrides?.id || createId(),
+    title: overrides?.title || '新会话',
+    updatedAt: overrides?.updatedAt,
+    preview: overrides?.preview,
+    persisted: overrides?.persisted ?? !isDraftSessionId(overrides?.id || ''),
+    messages: overrides?.messages || [],
+    nextCursor: overrides?.nextCursor || null,
+    hasMoreHistory: overrides?.hasMoreHistory || false,
+    historyLoaded: overrides?.historyLoaded || false,
+    historyLoading: overrides?.historyLoading || false
+  })
+
   const activeSessionId = ref('')
   const sessionList = ref<Session[]>([])
   const inputMessage = ref('')
   const loading = ref(false)
+  const abortController = ref<AbortController | null>(null)
+  const sessionListLoading = ref(false)
+  const sessionListPage = ref(1)
+  const sessionListHasMore = ref(false)
+  const initialized = ref(false)
 
-  // 当前会话
   const currentSession = computed(() => {
-    return sessionList.value.find(s => s.id === activeSessionId.value)
+    return sessionList.value.find(session => session.id === activeSessionId.value)
   })
 
-  // ========== 1. 创建新会话（极简：无引导语） ==========
-  const createNewSession = () => {
-    const newSession: Session = {
+  const findSession = (sessionId: string) => {
+    return sessionList.value.find(session => session.id === sessionId)
+  }
+
+  const isEmptyDraftSession = (session?: Session) => {
+    if (!session || session.persisted) return false
+    return !session.messages.some(message => message.content.trim())
+  }
+
+  const removeSessionLocally = (sessionId: string) => {
+    sessionList.value = sessionList.value.filter(session => session.id !== sessionId)
+    if (activeSessionId.value === sessionId) {
+      activeSessionId.value = sessionList.value[0]?.id || ''
+    }
+  }
+
+  const createLocalDraftSession = () => {
+    const now = new Date().toISOString()
+    const session = createEmptySession({
       id: createId(),
       title: '新会话',
-      messages: [] // 空消息列表，无引导语
-    }
-    sessionList.value.push(newSession)
-    activeSessionId.value = newSession.id
-    saveSessions()
+      updatedAt: now,
+      persisted: false,
+      historyLoaded: true
+    })
+    sessionList.value.unshift(session)
+    sortSessionsByRecent()
+    activeSessionId.value = session.id
+    persistSessionListCache()
+    return session
   }
 
-  // ========== 2. 本地存储（极简版） ==========
-  const loadSessions = () => {
-    if (process.client) {
-      const saved = localStorage.getItem('chat_sessions')
-      const activeId = localStorage.getItem('active_session_id')
-      if (saved) {
-        try {
-          sessionList.value = JSON.parse(saved)
-        } catch (e) {
-          sessionList.value = []
-        }
+  const getSessionTimestamp = (session: Pick<Session, 'updatedAt'>) => {
+    if (!session.updatedAt) return 0
+    const time = new Date(session.updatedAt).getTime()
+    return Number.isNaN(time) ? 0 : time
+  }
+
+  const sortSessionsByRecent = () => {
+    sessionList.value.sort((a, b) => {
+      const timeDiff = getSessionTimestamp(b) - getSessionTimestamp(a)
+      if (timeDiff !== 0) return timeDiff
+      return b.id.localeCompare(a.id)
+    })
+  }
+
+  const bumpSessionToTop = (sessionId: string, updatedAt?: string) => {
+    const session = findSession(sessionId)
+    if (!session) return
+
+    if (updatedAt) {
+      session.updatedAt = updatedAt
+    }
+
+    sortSessionsByRecent()
+  }
+
+  const persistSessionListCache = () => {
+    if (!process.client) return
+
+    const payload: SessionCachePayload = {
+      savedAt: Date.now(),
+      page: sessionListPage.value,
+      hasMore: sessionListHasMore.value,
+      activeSessionId: activeSessionId.value,
+      items: sessionList.value
+        .filter(session => session.persisted)
+        .map(session => ({
+        id: session.id,
+        title: session.title,
+        updatedAt: session.updatedAt,
+        preview: session.preview,
+        persisted: session.persisted
+      }))
+    }
+
+    sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify(payload))
+  }
+
+  const restoreSessionListCache = () => {
+    if (!process.client) return false
+
+    const raw = sessionStorage.getItem(SESSION_CACHE_KEY)
+    if (!raw) return false
+
+    try {
+      const payload = JSON.parse(raw) as SessionCachePayload
+      if (!payload?.savedAt || Date.now() - payload.savedAt > SESSION_CACHE_TTL) {
+        sessionStorage.removeItem(SESSION_CACHE_KEY)
+        return false
       }
-      if (activeId) activeSessionId.value = activeId
+
+      const cachedItems = Array.isArray(payload.items) ? payload.items : []
+      if (!cachedItems.length) {
+        return false
+      }
+
+      sessionList.value = cachedItems.map(item => createEmptySession(item))
+      sortSessionsByRecent()
+      activeSessionId.value = sessionList.value[0]?.id || payload.activeSessionId || ''
+      sessionListPage.value = payload.page || 2
+      sessionListHasMore.value = !!payload.hasMore
+      initialized.value = true
+      return true
+    } catch {
+      sessionStorage.removeItem(SESSION_CACHE_KEY)
+      return false
     }
   }
-  const saveSessions = () => {
+
+  const mergeMessages = (olderMessages: Message[], currentMessages: Message[]) => {
+    const merged = [...olderMessages, ...currentMessages]
+    const seen = new Set<string>()
+
+    return merged.filter((message) => {
+      if (seen.has(message.id)) {
+        return false
+      }
+      seen.add(message.id)
+      return true
+    })
+  }
+
+  const upsertSession = (session: Partial<Session> & { id: string }) => {
+    const index = sessionList.value.findIndex(item => item.id === session.id)
+    if (index === -1) {
+      sessionList.value.unshift(createEmptySession(session))
+      sortSessionsByRecent()
+      return findSession(session.id)!
+    }
+
+    sessionList.value[index] = {
+      ...sessionList.value[index],
+      ...session
+    }
+
+    sortSessionsByRecent()
+
+    return sessionList.value[index]
+  }
+
+  const ensureFallbackSession = async () => {
+    if (!auth.isLoggedIn.value) {
+      return
+    }
+
+    if (sessionList.value.length > 0) {
+      if (!activeSessionId.value) {
+        activeSessionId.value = sessionList.value[0].id
+      }
+      return
+    }
+
+    createLocalDraftSession()
+  }
+
+  const clearChatState = () => {
+    stopResponse()
+    activeSessionId.value = ''
+    sessionList.value = []
+    inputMessage.value = ''
+    loading.value = false
+    abortController.value = null
+    sessionListLoading.value = false
+    sessionListPage.value = 1
+    sessionListHasMore.value = false
+    initialized.value = false
     if (process.client) {
-      localStorage.setItem('chat_sessions', JSON.stringify(sessionList.value))
-      localStorage.setItem('active_session_id', activeSessionId.value)
+      sessionStorage.removeItem(SESSION_CACHE_KEY)
     }
   }
 
-  // ========== 3. 删除会话 ==========
-  const deleteSession = (id: string) => {
-    sessionList.value = sessionList.value.filter(s => s.id !== id)
+  const normalizeSessionPage = (sessions: ChatSessionDTO[]) => {
+    return sessions.map(session => createEmptySession(session))
+  }
+
+  const loadSessions = async (options?: { reset?: boolean }) => {
+    if (!auth.isLoggedIn.value) {
+      sessionList.value = []
+      activeSessionId.value = ''
+      sessionListHasMore.value = false
+      initialized.value = true
+      return
+    }
+
+    const reset = options?.reset ?? false
+    const nextPage = reset ? 1 : sessionListPage.value
+
+    if (sessionListLoading.value) return
+
+    sessionListLoading.value = true
+
+    try {
+      const result = await chatApi.listChatSessions({
+        page: nextPage,
+        pageSize: SESSION_PAGE_SIZE
+      })
+
+      const normalized = normalizeSessionPage(result.items)
+
+      if (reset) {
+        sessionList.value = normalized
+      } else {
+        const existingIds = new Set(sessionList.value.map(item => item.id))
+        sessionList.value.push(...normalized.filter(item => !existingIds.has(item.id)))
+      }
+
+      sortSessionsByRecent()
+
+      sessionListPage.value = nextPage + 1
+      sessionListHasMore.value = result.hasMore
+
+      if (sessionList.value.length === 0) {
+        await ensureFallbackSession()
+      } else if (reset || !activeSessionId.value || !findSession(activeSessionId.value)) {
+        activeSessionId.value = sessionList.value[0].id
+      }
+
+      persistSessionListCache()
+    } finally {
+      sessionListLoading.value = false
+      initialized.value = true
+    }
+  }
+
+  const loadMoreSessions = async () => {
+    if (!auth.isLoggedIn.value) return
+    if (!sessionListHasMore.value || sessionListLoading.value) return
+    await loadSessions()
+  }
+
+  const hydrateSessionMessages = async (sessionId: string, force = false) => {
+    if (!auth.isLoggedIn.value) return
+    const session = findSession(sessionId)
+    if (!session || session.historyLoading) return
+    if (!session.persisted) {
+      session.historyLoaded = true
+      session.hasMoreHistory = false
+      session.nextCursor = null
+      return
+    }
+    if (session.historyLoaded && !force) return
+
+    session.historyLoading = true
+
+    try {
+      const result = await chatApi.getChatMessages(sessionId, {
+        limit: MESSAGE_PAGE_SIZE
+      })
+
+      session.messages = result.items
+      session.nextCursor = result.nextCursor
+      session.hasMoreHistory = result.hasMore
+      session.historyLoaded = true
+    } finally {
+      session.historyLoading = false
+    }
+  }
+
+  const loadOlderMessages = async () => {
+    if (!auth.isLoggedIn.value) return
+    const session = currentSession.value
+    if (!session || !session.hasMoreHistory || session.historyLoading) return
+
+    session.historyLoading = true
+
+    try {
+      const result = await chatApi.getChatMessages(session.id, {
+        cursor: session.nextCursor,
+        limit: MESSAGE_PAGE_SIZE
+      })
+
+      session.messages = mergeMessages(result.items, session.messages)
+      session.nextCursor = result.nextCursor
+      session.hasMoreHistory = result.hasMore
+      session.historyLoaded = true
+    } finally {
+      session.historyLoading = false
+    }
+  }
+
+  const selectSession = async (sessionId: string) => {
+    if (!auth.isLoggedIn.value) return
+    if (activeSessionId.value === sessionId) {
+      await hydrateSessionMessages(sessionId)
+      return
+    }
+
+    const previousSession = currentSession.value
+    if (isEmptyDraftSession(previousSession)) {
+      removeSessionLocally(previousSession!.id)
+    }
+
+    activeSessionId.value = sessionId
+    persistSessionListCache()
+    await hydrateSessionMessages(sessionId)
+  }
+
+  const createNewSession = async () => {
+    if (!auth.isLoggedIn.value) return
+    stopResponse()
+    if (isEmptyDraftSession(currentSession.value)) {
+      activeSessionId.value = currentSession.value!.id
+      return
+    }
+    createLocalDraftSession()
+  }
+
+  const deleteSession = async (sessionId: string) => {
+    if (!auth.isLoggedIn.value) return
+    if (currentSession.value?.id === sessionId && loading.value) {
+      stopResponse()
+    }
+
+    const targetSession = findSession(sessionId)
+    removeSessionLocally(sessionId)
+
+    if (targetSession?.persisted) {
+      await chatApi.deleteChatSession(sessionId)
+    }
+
     activeSessionId.value = sessionList.value[0]?.id || ''
-    saveSessions()
-    if (sessionList.value.length === 0) createNewSession()
+    if (sessionList.value.length === 0) {
+      await ensureFallbackSession()
+    }
+    persistSessionListCache()
   }
 
-  // ========== 4. 初始化（极简） ==========
-  const initSessions = () => {
-    loadSessions()
-    if (sessionList.value.length === 0) createNewSession()
-    else if (!activeSessionId.value) activeSessionId.value = sessionList.value[0].id
+  const buildHistoryMessages = (messages: Message[]) => {
+    const historyMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [{
+      role: 'system',
+      content: '你是一个专业、友好的AI助手，回答简洁易懂'
+    }]
+
+    messages.forEach((message) => {
+      const normalizedContent = message.content.trim()
+      if (!normalizedContent) {
+        return
+      }
+
+      historyMessages.push({
+        role: message.role === 'ai' ? 'assistant' : 'user',
+        content: normalizedContent
+      })
+    })
+
+    return historyMessages
   }
 
-  // ========== 5. 发送消息（核心：无引导语逻辑） ==========
   const sendMessage = async () => {
+    if (!auth.isLoggedIn.value) return
     const content = inputMessage.value.trim()
     if (!content || loading.value || !currentSession.value) return
 
-    // 1. 添加用户消息
+    let session = currentSession.value
+    const isDraftSession = !session.persisted
+    const sessionId = session.id
+
     const userMsg: Message = {
       id: createId(),
       content,
       role: 'user',
-      time: dayjs().format('HH:mm')
+      time: dayjs().format('HH:mm'),
+      createdAt: new Date().toISOString()
     }
-    currentSession.value.messages.push(userMsg)
-    saveSessions()
 
-    // 2. 初始化变量
+    session.messages.push(userMsg)
+    session.historyLoaded = true
+    session.preview = content
+    session.updatedAt = userMsg.createdAt
+    persistSessionListCache()
+
     inputMessage.value = ''
     loading.value = true
+    abortController.value = new AbortController()
+
     const aiMsgId = createId()
     let fullContent = ''
 
-    // 3. 添加空AI消息
     const aiMsg: Message = {
       id: aiMsgId,
       content: '',
       role: 'ai',
       time: dayjs().format('HH:mm'),
+      createdAt: new Date().toISOString(),
       status: 'streaming'
     }
-    currentSession.value.messages.push(aiMsg)
-    saveSessions()
 
-    // 4. 构造历史消息（极简：只传用户/AI消息）
-    const historyMessages = [{
-      role: 'system',
-      content: '你是一个专业、友好的AI助手，回答简洁易懂'
-    }]
-    currentSession.value.messages.forEach(msg => {
-      historyMessages.push({
-        role: msg.role === 'ai' ? 'assistant' : msg.role,
-        content: msg.content
-      })
+    session.messages.push(aiMsg)
+    session = upsertSession({
+      id: sessionId,
+      preview: content,
+      updatedAt: userMsg.createdAt,
+      title: session.title === '新会话' || session.title === '新对话'
+        ? (content.slice(0, 20) || '新会话')
+        : session.title
     })
+    activeSessionId.value = session.id
 
-    // 5. 调用流式接口
-    await sendChatStreamToBackend(
+    const historyMessages = buildHistoryMessages(session.messages)
+
+    await chatApi.sendChatStreamToBackend(
       historyMessages,
       (chunk) => {
+        const targetSession = findSession(isDraftSession ? activeSessionId.value : sessionId) || findSession(sessionId)
+        if (!targetSession) return
+
         fullContent += chunk
-        // 更新AI消息
-        const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
-        if (index > -1) {
-          currentSession.value!.messages[index].content = fullContent
-          currentSession.value!.messages[index].status = 'streaming'
-        }
+        const targetMessage = targetSession.messages.find(message => message.id === aiMsgId)
+        if (!targetMessage) return
+
+        targetMessage.content = fullContent
+        targetMessage.status = 'streaming'
+        targetSession.preview = fullContent || content
+        targetSession.updatedAt = new Date().toISOString()
+        bumpSessionToTop(sessionId, targetSession.updatedAt)
+        persistSessionListCache()
       },
       () => {
+        const targetSession = findSession(activeSessionId.value) || findSession(sessionId)
         loading.value = false
-        const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
-        if (index > -1) {
-          currentSession.value!.messages[index].status = 'done'
+        abortController.value = null
+        if (!targetSession) return
+
+        const targetMessage = targetSession.messages.find(message => message.id === aiMsgId)
+        if (!targetMessage) return
+
+        if (targetMessage.status === 'streaming') {
+          targetMessage.status = 'done'
         }
-        // 更新会话标题
-        if (currentSession.value!.title === '新会话') {
-          currentSession.value!.title = content.slice(0, 10) || '新会话'
-          saveSessions()
+
+        if (targetSession.title === '新会话' || targetSession.title === '新对话') {
+          targetSession.title = content.slice(0, 20) || '新会话'
+        }
+
+        targetSession.preview = fullContent || content
+        targetSession.updatedAt = new Date().toISOString()
+        bumpSessionToTop(sessionId, targetSession.updatedAt)
+        persistSessionListCache()
+      },
+      (err, type) => {
+        const targetSession = findSession(activeSessionId.value) || findSession(sessionId)
+        loading.value = false
+        abortController.value = null
+        if (!targetSession) return
+
+        const targetMessage = targetSession.messages.find(message => message.id === aiMsgId)
+        if (!targetMessage) return
+
+        targetMessage.status = type === 'abort' ? 'interrupted' : 'error'
+        if (!targetMessage.content.trim()) {
+          targetMessage.content = type === 'abort'
+            ? '回答已停止。'
+            : '当前回答因网络或服务异常而中断。'
         }
       },
-      (err) => {
-        loading.value = false
-        const index = currentSession.value!.messages.findIndex(m => m.id === aiMsgId)
-        if (index > -1) {
-          currentSession.value!.messages[index].status = 'error'
-          if (!currentSession.value!.messages[index].content.trim()) {
-            currentSession.value!.messages[index].content = '当前回答因网络或服务异常而中断。'
-          }
+      {
+        signal: abortController.value.signal,
+        sessionId: isDraftSession ? undefined : sessionId,
+        onSessionCreated: (persistedSessionId) => {
+          const targetSession = findSession(sessionId)
+          if (!targetSession) return
+
+          targetSession.id = persistedSessionId
+          targetSession.persisted = true
+          activeSessionId.value = persistedSessionId
+          sortSessionsByRecent()
+          persistSessionListCache()
         }
-        console.error('chat stream error:', err)
       }
     )
   }
 
-  // 初始化 + 自动保存
-  initSessions()
-  watch([sessionList, activeSessionId], () => saveSessions(), { deep: true })
+  const stopResponse = () => {
+    if (!loading.value || !abortController.value) return
+    abortController.value.abort()
+  }
+
+  const initSessions = async (force = false) => {
+    if (initialized.value && !force) return
+
+    if (!auth.isLoggedIn.value) {
+      sessionList.value = []
+      activeSessionId.value = ''
+      sessionListHasMore.value = false
+      initialized.value = true
+      if (process.client) {
+        sessionStorage.removeItem(SESSION_CACHE_KEY)
+      }
+      return
+    }
+
+    if (!force && restoreSessionListCache()) {
+      if (activeSessionId.value) {
+        await hydrateSessionMessages(activeSessionId.value)
+      }
+      return
+    }
+
+    await loadSessions({ reset: true })
+
+    if (activeSessionId.value) {
+      await hydrateSessionMessages(activeSessionId.value)
+    }
+  }
 
   return {
     activeSessionId,
@@ -172,8 +578,16 @@ export const useChatStore = defineStore('chat', () => {
     inputMessage,
     loading,
     currentSession,
+    sessionListLoading,
+    sessionListHasMore,
+    loadMoreSessions,
+    initSessions,
+    clearChatState,
     createNewSession,
+    deleteSession,
+    selectSession,
+    loadOlderMessages,
     sendMessage,
-    deleteSession
+    stopResponse
   }
 })
